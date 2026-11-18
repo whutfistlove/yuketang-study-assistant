@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.2.9
+// @version      3.2.10
 // @description  按页面状态辅助播放、阅读课件和完成非考试学习任务。
 // @author       风之子
 // @license      GPL3
@@ -338,8 +338,18 @@
     run.log(`播放 ${name}`);
     const readyToPlay = !media.ended && !playerQuestionVisible(media.ownerDocument);
     const video = media.localName === 'video';
+    let selectedPlayerRate = false;
     const useVideoRate = () => {
       if (!video) return;
+      if (!selectedPlayerRate) {
+        const options = media.closest('xt-wrap')?.querySelectorAll('xt-speedlist xt-button[data-speed]') || [];
+        const option = Array.from(options).find(button => Number(button.getAttribute('data-speed')) === 2
+          && !button.closest('[disabled], [aria-disabled="true"], .is-disabled, [inert], [hidden]'));
+        if (option) {
+          selectedPlayerRate = true;
+          option.click();
+        }
+      }
       if (media.defaultPlaybackRate !== 2) media.defaultPlaybackRate = 2;
       if (media.playbackRate !== 2) media.playbackRate = 2;
     };
@@ -369,11 +379,11 @@
       if (media.error) throw new Pause(`${name} 播放出错，请检查网页播放器。`);
       if (media.ended && !media.seeking && Number.isFinite(media.duration) && media.duration > 0) return media;
       const now = performance.now();
-      if (media.currentTime > lastTime && !media.seeking) {
+      const advancing = media.currentTime > lastTime && !media.seeking;
+      if (!media.paused && !media.seeking && (advancing || playbackReported)) useVideoRate();
+      if (advancing) {
         lastMovement = now;
         if (!playbackReported) {
-          // 部分播放器会在启动时重新设置速率。视频实际开始播放后核对一次。
-          useVideoRate();
           run.log(`正在播放 ${name}${video ? ` · ${media.playbackRate}×` : ''}`);
           playbackReported = true;
         }

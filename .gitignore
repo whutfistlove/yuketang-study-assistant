@@ -1,0 +1,8 @@
+node_modules/
+runtime/
+EdgeProfile/
+settings.json
+*.dpapi
+*.log
+.env
+.env.*

@@ -24,10 +24,15 @@ function popupDestination(from, to, userGesture, allowedUrl) {
     if (/^\/v2\/web\/index\/?$/.test(source.pathname)) {
       return userGesture && /^\/v2\/web\/studentLog\/[^/]+\/?$/.test(target.pathname);
     }
+    const cardCourse = target.pathname.match(/^\/v2\/web\/studentCards\/(\d+)\/\d+\/\d+(?:\/ppt)?\/?$/)?.[1];
+    const workspace = source.pathname.match(/^\/ai-workspace\/lms-graph\/([^/]+)\/[^/]+\/[^/]+\/?$/)?.[1];
+    if (workspace) return cardCourse === workspace && (!target.searchParams.has('classroom_id')
+      || target.searchParams.get('classroom_id') === workspace);
     const classroom = source.pathname.match(/^\/v2\/web\/studentLog\/([^/]+)\/?$/)?.[1];
     if (!classroom) return false;
     const activity = target.pathname.match(/^\/ai-workspace\/lms-graph\/([^/]+)\/(?:graph|video|audio|ppt|courseware|forum|discussion|exercise|homework|quiz|practice|test|share)\/[^/]+\/?$/i);
     if (activity) return activity[1] === classroom;
+    if (cardCourse && !target.searchParams.has('classroom_id')) return cardCourse === classroom;
     return /^\/v2\/web\/(?:studentCards|studentVideo|studentHomework|exercise|homework|video|audio|share)\//i.test(target.pathname)
       && target.searchParams.get('classroom_id') === classroom;
   } catch {
@@ -84,7 +89,7 @@ async function launchBrowser({ settings, profile, browser = edgePath(), url = HO
   if (!allowedUrl(url)) throw new Error('请用雨课堂课程页的网址。');
   const startUrl = new URL(url);
   const selectingCourse = /^\/v2\/web\/index\/?$/.test(startUrl.pathname);
-  const allowPptResume = resumePpt && /^\/v2\/web\/studentCards\/[^?#]+\/ppt\/?$/.test(startUrl.pathname);
+  const allowPptResume = resumePpt && /^\/v2\/web\/studentCards\/(?:\d+\/\d+\/\d+|[^?#]+\/ppt)\/?$/.test(startUrl.pathname);
   const allowDirectoryResume = resumeDirectory && /^\/v2\/web\/studentLog\/[^/]+\/?$/.test(startUrl.pathname);
   const allowWorkspaceResume = resumeWorkspace && /^\/ai-workspace\/lms-graph\/[^/]+\/[^/]+\/[^/]+\/?$/.test(startUrl.pathname);
   let resumePending = allowPptResume || allowDirectoryResume || allowWorkspaceResume;
@@ -272,7 +277,7 @@ async function launchBrowser({ settings, profile, browser = edgePath(), url = HO
       && Math.abs(opening.at - item.attachedAt) <= 1000)) return;
     const { targetInfo } = await pipe.send('Target.getTargetInfo', { targetId: page.target.targetId });
     if (!isBlank(targetInfo.url) || opener.address !== opening.from) return;
-    if (/^\/v2\/web\/studentLog\//.test(new URL(opening.from).pathname)) {
+    if (/^\/(?:v2\/web\/studentLog|ai-workspace\/lms-graph)\//.test(new URL(opening.from).pathname)) {
       const context = opener.contexts.values().next().value;
       if (!context) return;
       const pending = await evaluate(opener, context, `globalThis.__yuketangIsOpening?.(${JSON.stringify(opening.from)}) === true`);

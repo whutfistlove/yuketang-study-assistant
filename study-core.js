@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.2.8
+// @version      3.2.9
 // @description  按页面状态辅助播放、阅读课件和完成非考试学习任务。
 // @author       风之子
 // @license      GPL3
@@ -111,6 +111,8 @@
     }
     const directory = path.match(/^\/v2\/web\/studentLog\/([^/]+)/);
     if (directory) return { view: 'directory', classroomId: directory[1] };
+    const standalonePpt = path.match(/^\/v2\/web\/studentCards\/(\d+)\/\d+\/\d+(?:\/ppt)?\/?$/);
+    if (standalonePpt) return { view: 'v2', classroomId: standalonePpt[1], kind: 'courseware' };
     if (path.startsWith('/pro/lms/')) return { view: 'pro' };
     if (path.startsWith('/v2/web/')) return { view: 'v2' };
     return null;
@@ -172,7 +174,7 @@
     }
   }
 
-  // 只接力由目录刚发起的导航。失败、停止和不匹配的跳转均清除命令。
+  // 只接力当前队列刚发起的导航。失败、停止和不匹配的跳转均清除命令。
   function saveHandoff(data) {
     sessionStorage.setItem(HANDOFF_KEY, JSON.stringify({ ...data, expires: Date.now() + OPEN_WAIT * 2 }));
   }
@@ -186,7 +188,8 @@
   if (NATIVE) globalThis.__yuketangIsOpening = from => {
     try {
       const pending = JSON.parse(sessionStorage.getItem(HANDOFF_KEY) || 'null');
-      return pending?.phase === 'open' && pending.from === from && location.href === from && pending.expires >= Date.now();
+      return ['open', 'workspace-ppt'].includes(pending?.phase) && pending.from === from
+        && location.href === from && pending.expires >= Date.now();
     } catch {
       return false;
     }
@@ -196,11 +199,28 @@
     try {
       const data = JSON.parse(sessionStorage.getItem(HANDOFF_KEY) || 'null');
       clearHandoff();
+      const route = getRoute();
+      if (route?.view === 'v2' && route.kind === 'courseware') {
+        const parent = sameOriginOpenerStorage();
+        const opening = JSON.parse(parent?.getItem(HANDOFF_KEY) || 'null');
+        const popup = opening?.phase === 'workspace-ppt' && opening.from === window.opener.location.href;
+        const pending = popup ? opening : data;
+        const linkedClassroom = new URLSearchParams(location.search).get('classroom_id');
+        if (pending?.phase === 'workspace-ppt' && pending.id && pending.expires >= Date.now()
+          && pending.classroomId === route.classroomId && (!linkedClassroom || linkedClassroom === route.classroomId)
+          && pending.returnUrl === pending.from && pending.from !== location.href) {
+          const source = new URL(pending.from);
+          if (source.origin !== location.origin || !source.pathname.startsWith(`/ai-workspace/lms-graph/${route.classroomId}/`)) return null;
+          if (!popup) return pending;
+          if (parent.getItem(HANDOFF_ACK_KEY)) return null;
+          parent.setItem(HANDOFF_ACK_KEY, pending.id);
+          return { ...pending, ownedPopup: true };
+        }
+      }
       if (!data || data.expires < Date.now() || !Array.isArray(data.verified)) return null;
       const target = new URL(data.returnUrl);
       const expectedId = target.pathname.match(/^\/v2\/web\/studentLog\/([^/]+)/)?.[1];
       if (target.origin !== location.origin || !expectedId) return null;
-      const route = getRoute();
       if (data.phase === 'return' && route?.view === 'directory' && location.href === target.href) return data;
       if (data.phase === 'open' && data.item?.key && data.from !== location.href && ['ai', 'v2', 'pro'].includes(route?.view)) {
         const classroomId = new URLSearchParams(location.search).get('classroom_id') || route.classroomId;
@@ -245,6 +265,13 @@
     if (!parent) return false;
     parent.setItem(HANDOFF_RESULT_KEY, `${state.id}:${outcome}`);
     return true;
+  }
+
+  function waitForPopupResult(run, id) {
+    return run.wait(() => {
+      const result = sessionStorage.getItem(HANDOFF_RESULT_KEY);
+      return result === `${id}:done` ? 'done' : result === `${id}:paused` ? 'paused' : null;
+    }, '新标签页还未确认完成，请在该页继续。', MANUAL_WAIT);
   }
 
   function courseDocuments() {
@@ -310,10 +337,13 @@
     let source = media.currentSrc;
     run.log(`播放 ${name}`);
     const readyToPlay = !media.ended && !playerQuestionVisible(media.ownerDocument);
-    if (readyToPlay && media.localName === 'video') {
-      media.defaultPlaybackRate = 2;
-      media.playbackRate = 2;
-    }
+    const video = media.localName === 'video';
+    const useVideoRate = () => {
+      if (!video) return;
+      if (media.defaultPlaybackRate !== 2) media.defaultPlaybackRate = 2;
+      if (media.playbackRate !== 2) media.playbackRate = 2;
+    };
+    if (readyToPlay) useVideoRate();
     if (readyToPlay && media.paused) {
       // 只尝试启动一次。播放器主动暂停或要求确认时，由用户继续。
       try {
@@ -342,7 +372,9 @@
       if (media.currentTime > lastTime && !media.seeking) {
         lastMovement = now;
         if (!playbackReported) {
-          run.log(`正在播放 ${name}`);
+          // 部分播放器会在启动时重新设置速率。视频实际开始播放后核对一次。
+          useVideoRate();
+          run.log(`正在播放 ${name}${video ? ` · ${media.playbackRate}×` : ''}`);
           playbackReported = true;
         }
       }
@@ -1671,6 +1703,18 @@
     return true;
   }
 
+  async function studyWorkspacePpt(run, state) {
+    if (state.ownedPopup && !handoffParent(state)) state = { ...state, ownedPopup: false };
+    run.retryFromDirectory = { page: location.href, state };
+    await studyAsset(run, 'courseware', state.item.name, hasCoursewareStatus);
+    if (!state.ownedPopup) return continueFromCourseware(run);
+    if (!signalParent(state, 'done')) throw new Pause('课件已完成，原课程队列已停止。');
+    run.log(`${state.item.name} 已确认完成，返回学习空间`);
+    window.opener.focus();
+    window.close();
+    return true;
+  }
+
   async function studyFromDirectory(run, state) {
     if (state?.phase === 'open') {
       if (state.ownedPopup && !handoffParent(state)) state = { ...state, ownedPopup: false };
@@ -1707,10 +1751,7 @@
     }, '当前标签页未打开课程详情。若课程在新标签页打开，请在那一页点「开始」。');
     if (opened === 'new-tab') {
       run.log('课程已在新标签页打开，等待当前项的完成状态。');
-      const completed = await run.wait(() => {
-        const result = sessionStorage.getItem(HANDOFF_RESULT_KEY);
-        return result === `${id}:done` ? 'done' : result === `${id}:paused` ? 'paused' : null;
-      }, '新标签页还未确认完成，请在该页继续。', MANUAL_WAIT);
+      const completed = await waitForPopupResult(run, id);
       clearHandoff();
       if (completed === 'paused') throw new Pause('新标签页已暂停，请查看该页提示。');
       run.log(`${item.name} 已确认完成，返回目录`);
@@ -1744,17 +1785,23 @@
     }
     let fromEarlierItem = false;
     let skippedExams = 0;
+    let completedPopup = null;
     while (true) {
       const route = getRoute();
       if (route?.view !== 'ai') throw new Pause('已离开学习空间。');
       const active = await run.wait(aiLeaf, '未识别到当前知识点。');
-      const name = normalize(label(active).replaceAll(WORKSPACE_DONE_ICON, '')) || '当前知识点';
-      const readDone = () => aiLeafDone() || assetDone(route.kind);
-      const verifyLeaf = fromEarlierItem || isExerciseKind(route.kind) || route.kind === 'discussion';
-      await studyAsset(run, route.kind, name, readDone, verifyLeaf ? aiLeafDone : readDone);
-      run.log(`${name} 已确认完成。`);
+      if (!completedPopup) {
+        const name = normalize(label(active).replaceAll(WORKSPACE_DONE_ICON, '')) || '当前知识点';
+        const readDone = () => aiLeafDone() || assetDone(route.kind);
+        const verifyLeaf = fromEarlierItem || isExerciseKind(route.kind) || route.kind === 'discussion';
+        await studyAsset(run, route.kind, name, readDone, verifyLeaf ? aiLeafDone : readDone);
+        run.log(`${name} 已确认完成。`);
+      }
       const leaves = visible(document, '.nav-item-leaf-box');
-      const index = leaves.findIndex(node => node.contains(aiLeaf()));
+      let index = leaves.findIndex(node => node.contains(completedPopup?.node || active));
+      if (index < 0 && completedPopup && normalize(label(leaves[completedPopup.index]).replaceAll(WORKSPACE_DONE_ICON, '')) === completedPopup.name) {
+        index = completedPopup.index;
+      }
       if (index < 0) throw new Pause('当前内容已完成。无法确认目录中的下一项。');
       const next = leaves.slice(index + 1).map(row => row.querySelector('.leaf-item') || row.firstElementChild).find(node => {
         if (!node) return false;
@@ -1770,13 +1817,28 @@
       }
       const url = location.href;
       const oldContent = assetStamp(route.kind);
-      await run.click(next, '下一项不可用。');
-      await run.wait(() => {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const name = normalize(label(next).replaceAll(WORKSPACE_DONE_ICON, '')) || '课件';
+      const nextIndex = leaves.findIndex(row => row.contains(next));
+      await run.click(() => {
+        if (location.href !== url) throw new Pause('学习空间已切换，请从当前内容重新开始。');
+        saveHandoff({ id, phase: 'workspace-ppt', from: url, returnUrl: url, classroomId: route.classroomId, item: { name } });
+        return next;
+      }, '下一项不可用。');
+      const opened = await run.wait(() => {
+        if (sessionStorage.getItem(HANDOFF_ACK_KEY) === id) return 'new-tab';
         const fresh = getRoute();
         if (location.href === url || fresh?.view !== 'ai' || fresh.classroomId !== route.classroomId || aiLeaf() === active) return false;
-        if (fresh.kind !== route.kind || aiLeafDone()) return Boolean(aiLeaf());
-        return Boolean(aiLeaf() && assetChanged(oldContent, fresh.kind));
+        return aiLeaf() && (fresh.kind !== route.kind || aiLeafDone() || assetChanged(oldContent, fresh.kind)) && 'same-tab';
       }, '下一项未加载完成，已停止切换。');
+      completedPopup = null;
+      if (opened === 'new-tab') {
+        const result = await waitForPopupResult(run, id);
+        if (result === 'paused') throw new Pause('课件标签页已暂停，请查看该页提示。');
+        completedPopup = { node: next, index: nextIndex, name };
+        run.log(`${name} 已确认完成。`);
+      }
+      clearHandoff();
       fromEarlierItem = true;
     }
   }
@@ -1833,9 +1895,12 @@
   }
 
   async function continueFromCourseware(run) {
-    const course = location.pathname.match(/^\/v2\/web\/studentCards\/(\d+)\//)?.[1];
+    const page = location.href;
     const params = new URLSearchParams(location.search);
-    if (!course || params.get('classroom_id') !== course || !params.get('university_id') || !params.get('platform_id')) return false;
+    const route = getRoute();
+    const course = location.pathname.match(/^\/v2\/web\/studentCards\/(\d+)\//)?.[1];
+    const linkedClassroom = params.get('classroom_id');
+    if (!course || (linkedClassroom && linkedClassroom !== course) || (!linkedClassroom && route.kind !== 'courseware')) return false;
     await run.wait(() => document.visibilityState === 'visible', '请回到课程页后继续。', MANUAL_WAIT);
     const recorded = pptProgress();
     if (recorded) {
@@ -1844,9 +1909,23 @@
       const confirmed = pptProgress(recorded.total);
       if (!confirmed || confirmed.read !== confirmed.total) throw new Pause('雨课堂正在同步课件进度，请稍后再继续。');
     }
+    if (!sameResourcePage(page)) throw new Pause('课件页面已切换。');
     const directory = new URL(`/v2/web/studentLog/${course}`, location.origin);
-    for (const key of ['university_id', 'platform_id', 'classroom_id']) directory.searchParams.set(key, params.get(key));
+    if (document.referrer) {
+      const referrer = new URL(document.referrer);
+      if (referrer.origin === location.origin && (referrer.pathname === directory.pathname
+        || referrer.pathname.startsWith(`/ai-workspace/lms-graph/${course}/`))) {
+        for (const key of ['university_id', 'platform_id']) {
+          if (!params.has(key) && referrer.searchParams.has(key)) params.set(key, referrer.searchParams.get(key));
+        }
+      }
+    }
+    for (const key of ['university_id', 'platform_id']) {
+      if (params.get(key)) directory.searchParams.set(key, params.get(key));
+    }
+    directory.searchParams.set('classroom_id', course);
     directory.searchParams.set('content_url', '');
+    directory.searchParams.set('tab', 'unfinished');
     saveHandoff({ phase: 'return', from: location.href, returnUrl: directory.href, verified: [] });
     run.log('PPT 已确认完成，返回目录继续。');
     location.assign(directory.href);
@@ -2001,7 +2080,8 @@
       panel.stop.disabled = false;
       let navigating = false;
       try {
-        if (handoff || route?.view === 'directory') navigating = await studyFromDirectory(run, handoff);
+        if (handoff?.phase === 'workspace-ppt') navigating = await studyWorkspacePpt(run, handoff);
+        else if (handoff || route?.view === 'directory') navigating = await studyFromDirectory(run, handoff);
         else if (route?.view === 'ai') await studyAiWorkspace(run);
         else if (route?.view === 'pro') await studyPro(run);
         else if (route?.view === 'v2') navigating = await studyV2Detail(run);
@@ -2035,7 +2115,7 @@
     };
     const handoff = takeHandoff();
     if (handoff) start(handoff);
-    else if (NATIVE && YKT_RESUME_PPT && /\/ppt\/?$/.test(location.pathname)) start(null);
+    else if (NATIVE && YKT_RESUME_PPT && (getRoute()?.kind === 'courseware' || /\/ppt\/?$/.test(location.pathname))) start(null);
     else if (NATIVE && YKT_RESUME_DIRECTORY && getRoute()?.view === 'directory') start(null);
     else if (NATIVE && YKT_RESUME_WORKSPACE && getRoute()?.view === 'ai') {
       panel.log('学习空间已开始续跑。');

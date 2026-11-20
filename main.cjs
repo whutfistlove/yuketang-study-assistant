@@ -206,7 +206,7 @@ async function launchBrowser({ settings, profile, browser = edgePath(), url = HO
         if (resume) resumePending = false;
       } else if (message.method === 'studyStatus') {
         if (typeof message.value === 'string' && message.value.length <= 160
-          && /^(?:请选择要学习的课程|开始处理课程目录|PPT |打开 |播放 |正在播放 |正在生成讨论回复 |发布讨论 |正在解答当前题目|正在读取当前图片题|测验进度 |提交 |提交第 |提交当前题|等待雨课堂|请点击网页播放器|请完成并提交|请使用网页|请阅读 |流程已暂停|当前目录|学习空间)|已确认完成/.test(message.value)) {
+          && /^(?:请选择要学习的课程|开始处理课程目录|PPT |打开 |播放 |正在播放 |正在生成讨论回复 |发布讨论 |正在解答当前题目|正在读取当前图片题|测验进度 |提交 |提交第 |提交当前题|跳过 |已跳过 |等待雨课堂|请点击网页播放器|请完成并提交|请使用网页|请阅读 |流程已暂停|当前目录|学习空间)|已确认完成/.test(message.value)) {
           activeSession = page.id;
           info(message.value.replace(/[\r\n]/g, ' '));
         }

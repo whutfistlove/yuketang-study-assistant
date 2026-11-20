@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.2.11
+// @version      3.2.12
 // @description  按页面状态辅助播放、阅读课件和完成非考试学习任务。
 // @author       风之子
 // @license      GPL3
@@ -54,7 +54,7 @@
   const EXAM_PATH = /(?:^|\/)(?:(?:student)?exam(?:ination)?|kaoshi|timed-exam)(?:\/|$)/i;
 
   class Pause extends Error {}
-  class StatusPending extends Pause {}
+  class SkipItem extends Error {}
 
   const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
   const label = element => normalize(element?.innerText ?? element?.textContent);
@@ -163,7 +163,7 @@
         if (value) return value;
         await sleep(250, this.signal);
       } while (performance.now() < until);
-      throw message instanceof Pause ? message : new Pause(message);
+      throw message instanceof Error ? message : new Pause(message);
     }
 
     async click(target, message) {
@@ -201,6 +201,10 @@
       const data = JSON.parse(sessionStorage.getItem(HANDOFF_KEY) || 'null');
       clearHandoff();
       const route = getRoute();
+      if (data?.phase === 'workspace-return' && route?.view === 'ai' && data.expires >= Date.now()
+        && data.returnUrl === location.href && data.classroomId === route.classroomId
+        && Number.isSafeInteger(data.item?.index) && data.item.index >= 0 && data.item.name
+        && ['done', 'skipped'].includes(data.outcome)) return data;
       if (route?.view === 'v2' && route.kind === 'courseware') {
         const parent = sameOriginOpenerStorage();
         const opening = JSON.parse(parent?.getItem(HANDOFF_KEY) || 'null');
@@ -271,7 +275,7 @@
   function waitForPopupResult(run, id) {
     return run.wait(() => {
       const result = sessionStorage.getItem(HANDOFF_RESULT_KEY);
-      return result === `${id}:done` ? 'done' : result === `${id}:paused` ? 'paused' : null;
+      return ['done', 'skipped', 'paused'].find(outcome => result === `${id}:${outcome}`);
     }, '新标签页还未确认完成，请在该页继续。', MANUAL_WAIT);
   }
 
@@ -337,7 +341,7 @@
       previousMedia = next;
       previousSource = nextSource;
       return null;
-    }, `${name} 的播放器未就绪，已停在当前项。`);
+    }, new SkipItem('播放器未加载。'));
     if (state.done) return null;
     const { media } = state;
     let source = media.currentSrc;
@@ -391,7 +395,7 @@
       }
       source ||= media.currentSrc;
       if (playerQuestionVisible(media.ownerDocument)) throw new Pause('视频出现待答题目，处理后点「开始」。');
-      if (media.error) throw new Pause(`${name} 播放出错，请检查网页播放器。`);
+      if (media.error) throw new SkipItem('播放器报错。');
       if (media.ended && !media.seeking && Number.isFinite(media.duration) && media.duration > 0) return media;
       const now = performance.now();
       const advancing = media.currentTime > lastTime && !media.seeking;
@@ -413,55 +417,32 @@
       }
       const limit = Number.isFinite(media.duration) ? Math.max(MANUAL_WAIT, media.duration * 3_000) : MANUAL_WAIT;
       if (now - lastMovement > PLAYBACK_IDLE || now - playbackStartedAt > limit) {
-        throw new Pause(`${name} 未播完，已停在当前项。`);
+        throw new SkipItem('播放长时间没有推进。');
       }
       await sleep(250, run.signal);
     }
   }
 
-  async function confirmStatus(run, page, readDone, name) {
+  async function confirmStatus(run, page, readDone, name, pendingMessage = () => '雨课堂尚未显示完成。') {
     run.log(`等待雨课堂确认 ${name} 的完成状态`);
     await run.wait(() => {
       if (!sameResourcePage(page)) throw new Pause('页面已切换，当前项的完成状态未确认。');
       return readDone();
-    }, new StatusPending(`${name} 尚未显示完成，已停在当前项。`), STATUS_WAIT);
+    }, new SkipItem('雨课堂尚未显示完成。'), STATUS_WAIT).catch(error => {
+      if (!(error instanceof SkipItem)) throw error;
+      throw new SkipItem(pendingMessage());
+    });
   }
 
   async function studyMedia(run, kind, name, readDone, readMedia = () => courseMedia(kind)) {
     const url = location.href;
     const headerDone = () => workspaceAssetDone(kind, name);
     const done = () => headerDone() || readDone();
-    let replayed = false;
-    while (true) {
-      const media = await watchMedia(run, readMedia, name, headerDone);
-      if (!media) return;
-      try {
-        await confirmStatus(run, url, done, name);
-        return;
-      } catch (error) {
-        if (!(error instanceof StatusPending) || kind !== 'video') throw error;
-        const progress = workspaceVideoProgress(name);
-        if (progress === null) throw error;
-        const replay = playerPlayButton(media);
-        const missedStart = !media.played.length || media.played.start(0) > 1;
-        if (replayed || progress !== 0 || !missedStart || !isEnabled(replay) || label(replay) !== '重播') {
-          throw new Pause(`${name} 已播到末尾，雨课堂完成度仍为 ${progress}%。请查看视频「详情」中的观看记录。`);
-        }
-        await run.wait(() => document.visibilityState === 'visible', '请回到视频页面后继续。', MANUAL_WAIT);
-        if (!sameResourcePage(url) || readMedia() !== media) throw new Pause('视频页面已切换。');
-        if (done()) return;
-        if (!media.ended || !isEnabled(replay) || label(replay) !== '重播') throw new Pause('播放器状态已变化，请从当前视频继续。');
-        replayed = true;
-        run.log('页面仍显示 0%，本页没有从开头的播放记录。使用网页的重播按钮补看一次。');
-        replay.click();
-        const resumed = await run.wait(() => {
-          if (!sameResourcePage(url)) throw new Pause('视频页面已切换。');
-          if (done()) return 'done';
-          return !media.paused && !media.ended && 'playing';
-        }, '重播尚未开始，请点击网页播放器的播放键。');
-        if (resumed === 'done') return;
-      }
-    }
+    if (!await watchMedia(run, readMedia, name, headerDone)) return;
+    await confirmStatus(run, url, done, name, () => {
+      const progress = workspaceVideoProgress(name);
+      return progress === null ? '播放结束后，雨课堂尚未显示完成。' : `播放结束后，雨课堂完成度仍为 ${progress}%。`;
+    });
   }
 
   function readSlides(wrapper) {
@@ -689,7 +670,7 @@
     const openPreview = visible(document, '.ppt_img_box .check, p.check, button').find(node => label(node) === '查看课件');
     if (openPreview) await run.click(openPreview, '请点击网页的「查看课件」。');
     const initial = await run.wait(() => slideGroup() || firstVisible(document, '.video-box') || courseMedia('video'),
-      '未找到可识别的 PPT 或课件视频。');
+      new SkipItem('未找到可识别的 PPT 或课件视频。'));
     const page = location.href;
     if (initial.slides) {
       await readSlideDeck(run, initial, name);
@@ -1231,7 +1212,7 @@
       confirmCurrent();
       return exerciseConfirmations(doc).find(dialog => !existing.has(dialog)
         && action(dialog, /^(?:确定|确认|提交|交卷|确认提交|确定提交|确认交卷|确定交卷)$/));
-    }, `${name} 尚未显示提交成功，已停在当前项。`, STATUS_WAIT);
+    }, new SkipItem('雨课堂尚未确认整份作业提交成功。'), STATUS_WAIT);
     if (confirmation === 'done') return;
     await run.click(() => {
       confirmCurrent();
@@ -1241,7 +1222,7 @@
     await run.wait(() => {
       checkPage();
       return exerciseDone(readDone);
-    }, `${name} 尚未显示提交成功，已停在当前项。`, STATUS_WAIT);
+    }, new SkipItem('雨课堂尚未确认整份作业提交成功。'), STATUS_WAIT);
   }
 
   async function studyExercise(run, name, readDone, kind = 'exercise') {
@@ -1253,15 +1234,11 @@
     const root = await run.wait(() => {
       checkPage();
       return exerciseRoot();
-    }, '未识别到题目区域，已停在当前项。');
-    const waitManually = async () => {
-      run.log(`请完成并提交 ${name}。页面确认提交后将继续。`);
-      await run.wait(() => {
-        checkPage();
-        return exerciseDone(readDone);
-      }, '本项尚未显示已提交，请完成后再继续。', MANUAL_WAIT);
+    }, new SkipItem('未识别到题目区域。'));
+    const requireSupportedExercise = root => {
+      if (!canAnswer(run, root, kind)) throw new SkipItem('此作业没有启用自动作答或需要本人处理。');
     };
-    if (!canAnswer(run, root, kind)) return waitManually();
+    requireSupportedExercise(root);
 
     const seen = new Set();
     const visitedTabs = new Set();
@@ -1273,8 +1250,8 @@
         if (current?.embedded && !exerciseProgress(current.body.ownerDocument)
           && current.options?.every(({ control }) => controlLocked(control)) && !answered(current)) return null;
         return current;
-      }, '没有识别到当前题干或可作答选项，已停在当前题。');
-      if (!canAnswer(run, exerciseRoot(), kind)) return waitManually();
+      }, new SkipItem('未识别到当前题干或可作答选项。'));
+      requireSupportedExercise(exerciseRoot());
       if (seen.has(question.key)) throw new Pause('题目没有切换成功，请检查当前题。');
       seen.add(question.key);
       const questionId = question.body.dataset.questionId;
@@ -1334,7 +1311,7 @@
             if (progress && progress.total === progressBefore.total && progress.answered === progressBefore.answered + 1) return true;
             const verified = getQuestion(root);
             return verified?.key === question.key && answered(verified);
-          }, '没有收到本题提交成功的反馈，已停在当前题。', STATUS_WAIT);
+          }, new SkipItem('雨课堂尚未确认本题提交成功。'), STATUS_WAIT);
           saved = true;
           const currentDoc = exerciseRoot()?.ownerDocument;
           const confirmed = question.embedded && currentDoc && sameFrame(currentDoc) && exerciseProgress(currentDoc);
@@ -1352,10 +1329,10 @@
         const current = getQuestion(root);
         return current && { root, current };
       };
-      const afterAnswer = await run.wait(readTransition, '没有识别到当前题干或可作答选项，已停在当前题。');
+      const afterAnswer = await run.wait(readTransition, new SkipItem('未识别到当前题干或可作答选项。'));
       if (afterAnswer === 'done') return;
       const loadedRoot = afterAnswer.root;
-      if (!canAnswer(run, loadedRoot, kind)) return waitManually();
+      requireSupportedExercise(loadedRoot);
       const navigation = question.embedded ? loadedRoot.ownerDocument : loadedRoot;
       const tabs = questionTabs(navigation);
       let currentIndex = tabs.findIndex(tab => questionId && tab.dataset.questionId === questionId);
@@ -1409,7 +1386,7 @@
           }
         }
         return null;
-      }, '下一题没有加载成功。');
+      }, new SkipItem('下一题没有加载成功。'));
     }
   }
 
@@ -1541,14 +1518,7 @@
       sessionStorage.removeItem(pendingKey);
       return;
     }
-    if (!run.settings.autoDiscussion) {
-      run.log(`请使用网页完成 ${name}。可在助手设置中启用自动讨论。`);
-      await run.wait(() => {
-        checkPage();
-        return done();
-      }, `${name} 尚未显示已参与。`, MANUAL_WAIT);
-      return;
-    }
+    if (!run.settings.autoDiscussion) throw new SkipItem('此讨论没有启用自动处理。');
 
     const ready = await run.wait(() => {
       checkPage();
@@ -1556,7 +1526,7 @@
       const editor = discussionEditor();
       const topic = discussionTopic(name);
       return editor && topic && isEnabled(editor.field) && { ...editor, topic };
-    }, '没有找到讨论题目或可用的发布编辑框。');
+    }, new SkipItem('没有找到讨论题目或可用的发布编辑框。'));
     if (ready === 'done') return;
     if (normalize(readTextField(ready.field))) throw new Pause('讨论编辑框已有草稿，已保留当前内容。');
     const limit = ready.field.maxLength >= 0 ? Math.min(800, ready.field.maxLength) : 800;
@@ -1606,7 +1576,7 @@
 
   async function studyAsset(run, kind, name, readDone, canSkip = readDone) {
     run.check();
-    if (kind === 'exam' || (isExerciseKind(kind) && isExamPage(document))) throw new Pause(`${name} 是考试任务。`);
+    if (kind === 'exam' || (isExerciseKind(kind) && isExamPage(document))) throw new SkipItem('此任务需要本人参加考试。');
     if (kind === 'discussion') return studyDiscussion(run, name, canSkip);
     if (canSkip() || workspaceAssetDone(kind, name)) return;
     if (kind === 'classroom') {
@@ -1616,7 +1586,7 @@
         const frame = firstVisible(document, iframeSelector);
         const media = frame?.contentDocument ? mediaNodes(frame.contentDocument) : [];
         return media.length && media;
-      }, `${name} 的回放未加载，已停在当前项。`);
+      }, new SkipItem('课堂回放未加载。'));
       for (const track of tracks) await watchMedia(run, () => mediaVisible(track) ? track : null, name);
       await confirmStatus(run, page, readDone, name);
     } else if (kind === 'video' || kind === 'audio') {
@@ -1625,17 +1595,26 @@
       await studyCourseware(run, name, readDone);
     } else if (isExerciseKind(kind)) {
       await studyExercise(run, name, canSkip, kind);
-    } else if (kind === 'reading' || kind === 'share') {
-      const page = new URL(location.href);
-      run.log(kind === 'share' ? `请使用网页完成 ${name}。雨课堂确认后将继续。` : `请阅读 ${name}，等待网页显示完成。`);
-      await run.wait(() => {
-        const current = new URL(location.href);
-        if (page.origin !== current.origin || page.pathname !== current.pathname) throw new Pause('页面已切换，本项状态未确认。');
-        return readDone() || workspaceAssetDone(kind, name)
-          || (kind === 'share' && hasDone(document, '.share-status, .share-task .status, .sharing-status'));
-      }, `${name} 尚未显示完成。`, MANUAL_WAIT);
+    } else if (kind === 'reading') {
+      await confirmStatus(run, location.href, () => readDone() || workspaceAssetDone(kind, name), name);
+    } else if (kind === 'share') {
+      if (!hasDone(document, '.share-status, .share-task .status, .sharing-status')) throw new SkipItem('此分享需要本人使用网页完成。');
     } else {
-      throw new Pause(`无法识别 ${name} 的类型，已停在当前项。`);
+      throw new SkipItem('无法识别任务类型。');
+    }
+  }
+
+  async function processAsset(run, kind, name, readDone, canSkip) {
+    const page = location.href;
+    try {
+      await studyAsset(run, kind, name, readDone, canSkip);
+      return 'done';
+    } catch (error) {
+      if (!(error instanceof SkipItem)) throw error;
+      run.check();
+      if (!sameResourcePage(page)) throw new Pause('页面已切换，请从当前内容重新开始。');
+      await run.log(`跳过 ${name}。${error.message}`);
+      return 'skipped';
     }
   }
 
@@ -1658,16 +1637,7 @@
   const directoryDocumentId = Math.random().toString(36).slice(2);
   let anonymousRowNumber = 0;
 
-  function directoryRowId(entry, link, index) {
-    const id = entry.getAttribute('data-id') || (link?.origin === location.origin && link.pathname !== location.pathname && link.href);
-    if (id) return id;
-    if (!entry.matches(UNFINISHED_ROW) && new URLSearchParams(location.search).get('tab') !== 'unfinished') return index;
-    // 未完成列表移除已完成项后，序号会变。仅在当前页面缓存无编号条目。
-    if (!anonymousRows.has(entry)) anonymousRows.set(entry, `${directoryDocumentId}-${++anonymousRowNumber}`);
-    return anonymousRows.get(entry);
-  }
-
-  function describeRow(entry, group, index) {
+  function describeRow(entry, group, index, occurrences, skipGroup = group) {
     const tag = entry.querySelector('.tag, .unfinished-study__type-text');
     const icon = tag?.querySelector('use');
     const expand = entry.querySelector('.sub-info .gray span');
@@ -1681,9 +1651,26 @@
     let kind = linkedType || type || (expand ? 'batch' : titleType);
     if (type === 'exam' || linkedType === 'exam') kind = 'exam';
     else if (type === 'homework' && linkedType === 'exercise') kind = type;
-    const key = JSON.stringify([group, directoryRowId(entry, internalLink, index), kind, name]);
+    const id = entry.getAttribute('data-id') || (internalLink?.origin === location.origin && path !== location.pathname && internalLink.href);
+    let rowId = id;
+    let skipId = id;
+    if (!rowId) {
+      if (!entry.matches(UNFINISHED_ROW) && new URLSearchParams(location.search).get('tab') !== 'unfinished') {
+        rowId = index;
+      } else {
+        if (!anonymousRows.has(entry)) anonymousRows.set(entry, `${directoryDocumentId}-${++anonymousRowNumber}`);
+        rowId = anonymousRows.get(entry);
+      }
+      const signature = JSON.stringify([kind, name, label(tag)]);
+      const occurrence = (occurrences.get(signature) || 0) + 1;
+      occurrences.set(signature, occurrence);
+      // 跳过的条目仍留在未完成列表里，返回目录时按类型和同名顺序找回。
+      skipId = [signature, occurrence];
+    }
+    const key = JSON.stringify([group, rowId, kind, name]);
+    const skipKey = JSON.stringify([skipGroup, skipId, kind, name]);
     const target = entry.matches(UNFINISHED_ROW) ? entry.querySelector('button.unfinished-study__arrow') : entry;
-    return { element: entry, target, expand, key, kind, name };
+    return { element: entry, target, expand, key, skipKey, kind, name };
   }
 
   const rowDone = item => visible(item.element, ROW_STATUS).some(node => isDone(label(node), ['batch', 'courseware'].includes(item.kind)));
@@ -1692,24 +1679,34 @@
     return visible(row, '.leaf_list__wrap .activity__wrap');
   }
 
-  async function nextDirectoryItem(run, verified, exams = new Set()) {
+  async function nextDirectoryItem(run, verified, exams = new Set(), skipped = new Set()) {
     const pending = item => {
-      if (rowDone(item) || verified.has(item.key)) return false;
-      if (item.kind !== 'exam') return true;
-      exams.add(item.key);
-      return false;
+      if (rowDone(item) || verified.has(item.key) || skipped.has(item.skipKey)) return false;
+      if (item.kind === 'exam') {
+        exams.add(item.key);
+        return false;
+      }
+      if (!item.kind) {
+        skipped.add(item.skipKey);
+        run.log(`跳过 ${item.name}。无法识别任务类型。`);
+        return false;
+      }
+      return true;
     };
     let rows = await run.wait(directoryContents, '目录未加载，找不到课程条目。');
     while (true) {
+      run.check();
+      const occurrences = new Map();
       for (const [index, { row, entry }] of rows.entries()) {
-        const item = describeRow(entry, '', index);
+        const item = describeRow(entry, '', index, occurrences);
         if (!pending(item)) continue;
         if (item.kind !== 'batch') return item;
         if (!batchRows(row).length) {
           await run.click(item.expand, `${item.name} 的展开按钮不可用。`);
           await run.wait(() => batchRows(row).length, `${item.name} 的子条目未加载。`);
         }
-        const child = batchRows(row).map((element, childIndex) => describeRow(element, item.key, childIndex))
+        const childOccurrences = new Map();
+        const child = batchRows(row).map((element, childIndex) => describeRow(element, item.key, childIndex, childOccurrences, item.skipKey))
           .find(pending);
         if (child) return child;
       }
@@ -1751,21 +1748,23 @@
     return hasDetailDone() || (kind === 'courseware' && hasCoursewareStatus());
   }
 
-  async function returnToDirectory(run, state) {
+  async function returnToDirectory(run, state, outcome) {
     await run.wait(() => document.visibilityState === 'visible', '请回到当前课程页后继续。', MANUAL_WAIT);
     const returnUrl = new URL(state.returnUrl);
     if (returnUrl.origin !== location.origin || !/^\/v2\/web\/studentLog\//.test(returnUrl.pathname)) {
-      throw new Pause('课程已确认完成，请返回目录继续。');
+      throw new Pause('无法返回原课程目录，请在目录中点「开始」。');
     }
-    if (signalParent(state, 'done')) {
-      run.log(`${state.item.name} 已确认完成，返回目录`);
+    if (outcome === 'done') run.log(`${state.item.name} 已确认完成，返回目录`);
+    if (signalParent(state, outcome)) {
       window.opener.focus();
       window.close();
       return true;
     }
-    const verified = [...new Set([...state.verified, state.item.key])];
-    saveHandoff({ phase: 'return', from: location.href, returnUrl: returnUrl.href, verified });
-    run.log(`${state.item.name} 已确认完成，返回目录`);
+    const verified = new Set(state.verified);
+    const skipped = new Set(state.skipped);
+    if (outcome === 'done') verified.add(state.item.key);
+    else skipped.add(state.item.skipKey || state.item.key);
+    saveHandoff({ phase: 'return', from: location.href, returnUrl: returnUrl.href, verified: [...verified], skipped: [...skipped] });
     location.assign(returnUrl.href);
     return true;
   }
@@ -1773,10 +1772,16 @@
   async function studyWorkspacePpt(run, state) {
     if (state.ownedPopup && !handoffParent(state)) state = { ...state, ownedPopup: false };
     run.retryFromDirectory = { page: location.href, state };
-    await studyAsset(run, 'courseware', state.item.name, hasCoursewareStatus);
-    if (!state.ownedPopup) return continueFromCourseware(run);
-    if (!signalParent(state, 'done')) throw new Pause('课件已完成，原课程队列已停止。');
-    run.log(`${state.item.name} 已确认完成，返回学习空间`);
+    const outcome = await processAsset(run, 'courseware', state.item.name, hasCoursewareStatus);
+    if (!state.ownedPopup) {
+      if (!Number.isSafeInteger(state.item.index)) return outcome === 'done' && continueFromCourseware(run);
+      await run.wait(() => document.visibilityState === 'visible', '请回到课件页后继续。', MANUAL_WAIT);
+      saveHandoff({ ...state, phase: 'workspace-return', outcome });
+      location.assign(state.returnUrl);
+      return true;
+    }
+    if (!signalParent(state, outcome)) throw new Pause('原课程队列已停止。');
+    if (outcome === 'done') run.log(`${state.item.name} 已确认完成，返回学习空间`);
     window.opener.focus();
     window.close();
     return true;
@@ -1790,21 +1795,25 @@
       // AI 学习空间的 exercise 路由比目录中的批量分类更精确。
       const kind = route?.view === 'ai' && route.kind && !(route.kind === 'exercise' && state.item.kind === 'homework') ? route.kind : state.item.kind;
       const leafDone = () => route?.view === 'ai' && aiLeafDone();
-      await studyAsset(run, kind, state.item.name, () => leafDone() || assetDone(kind), leafDone);
-      return returnToDirectory(run, state);
+      const outcome = await processAsset(run, kind, state.item.name, () => leafDone() || assetDone(kind), leafDone);
+      return returnToDirectory(run, state, outcome);
     }
     const returnUrl = location.href;
     const verified = new Set(state?.verified || []);
+    const skipped = new Set(state?.skipped || []);
     const exams = new Set();
-    const item = await nextDirectoryItem(run, verified, exams);
+    const item = await nextDirectoryItem(run, verified, exams, skipped);
     if (!item) {
-      run.log(exams.size ? `当前目录其余已加载任务均已确认完成。${exams.size} 场考试待处理。` : '当前目录已加载的项目均已确认完成。');
+      const summary = skipped.size ? `当前目录已处理到末尾。${skipped.size} 项跳过，仍可在目录中处理。` : '当前目录已加载的项目均已确认完成。';
+      run.log(`${summary}${exams.size ? `${exams.size} 场考试待处理。` : ''}`);
       return false;
     }
-    if (!item.kind) throw new Pause(`无法识别 ${item.name} 的任务类型，已停在目录。`);
     const before = assetElement(item.kind);
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const handoff = { id, phase: 'open', from: returnUrl, returnUrl, verified: [...verified], item: { key: item.key, kind: item.kind, name: item.name } };
+    const handoff = {
+      id, phase: 'open', from: returnUrl, returnUrl, verified: [...verified], skipped: [...skipped],
+      item: { key: item.key, skipKey: item.skipKey, kind: item.kind, name: item.name },
+    };
     await run.wait(() => document.visibilityState === 'visible', '请回到课程目录后继续。', MANUAL_WAIT);
     if (location.href !== returnUrl) throw new Pause('课程目录已切换，请从当前目录开始。');
     saveHandoff(handoff);
@@ -1818,12 +1827,13 @@
     }, '当前标签页未打开课程详情。若课程在新标签页打开，请在那一页点「开始」。');
     if (opened === 'new-tab') {
       run.log('课程已在新标签页打开，等待当前项的完成状态。');
-      const completed = await waitForPopupResult(run, id);
+      const outcome = await waitForPopupResult(run, id);
       clearHandoff();
-      if (completed === 'paused') throw new Pause('新标签页已暂停，请查看该页提示。');
-      run.log(`${item.name} 已确认完成，返回目录`);
-      verified.add(item.key);
-      return studyFromDirectory(run, { phase: 'return', verified: [...verified] });
+      if (outcome === 'paused') throw new Pause('新标签页已暂停，请查看该页提示。');
+      run.log(outcome === 'done' ? `${item.name} 已确认完成，返回目录` : `已跳过 ${item.name}，返回目录`);
+      if (outcome === 'done') verified.add(item.key);
+      else skipped.add(item.skipKey);
+      return studyFromDirectory(run, { phase: 'return', verified: [...verified], skipped: [...skipped] });
     }
     clearHandoff();
     return studyFromDirectory(run, handoff);
@@ -1846,34 +1856,44 @@
     });
   }
 
-  async function studyAiWorkspace(run) {
+  async function studyAiWorkspace(run, returnState) {
     if (document.visibilityState !== 'visible') {
       run.log('学习空间窗口在后台，回到课程页后继续。');
       await run.wait(() => document.visibilityState === 'visible', '请回到学习空间后继续。', MANUAL_WAIT);
     }
     let fromEarlierItem = false;
     let skippedExams = 0;
-    let completedPopup = null;
+    let skippedItems = returnState?.outcome === 'skipped' ? 1 : 0;
+    let handledPopup = returnState?.item || null;
+    let contentUnavailable = false;
     while (true) {
       const route = getRoute();
       if (route?.view !== 'ai') throw new Pause('已离开学习空间。');
       const active = await run.wait(aiLeaf, '未识别到当前知识点。');
       const currentPage = location.href;
-      if (!completedPopup) {
+      if (!handledPopup) {
         const name = normalize(label(active).replaceAll(WORKSPACE_DONE_ICON, '')) || '当前知识点';
         const readDone = () => aiLeafDone() || assetDone(route.kind);
         const verifyLeaf = fromEarlierItem || isExerciseKind(route.kind) || route.kind === 'discussion';
-        await studyAsset(run, route.kind, name, readDone, verifyLeaf ? aiLeafDone : readDone);
+        let outcome;
+        if (contentUnavailable && !aiLeafDone()) {
+          run.log(`跳过 ${name}。页面内容未加载。`);
+          outcome = 'skipped';
+        } else {
+          outcome = await processAsset(run, route.kind, name, readDone, verifyLeaf ? aiLeafDone : readDone);
+        }
         if (!sameResourcePage(currentPage)) throw new Pause('学习空间已切换，请从当前内容重新开始。');
-        run.log(`${name} 已确认完成。`);
+        if (outcome === 'done') run.log(`${name} 已确认完成。`);
+        else skippedItems++;
       }
       const finishedLeaf = aiLeaf() || active;
       const leaves = visible(document, '.nav-item-leaf-box');
-      let index = leaves.findIndex(node => node.contains(completedPopup?.node || finishedLeaf));
-      if (index < 0 && completedPopup && normalize(label(leaves[completedPopup.index]).replaceAll(WORKSPACE_DONE_ICON, '')) === completedPopup.name) {
-        index = completedPopup.index;
+      const processed = handledPopup ? handledPopup.node : finishedLeaf;
+      let index = processed ? leaves.findIndex(node => node.contains(processed)) : -1;
+      if (index < 0 && handledPopup && normalize(label(leaves[handledPopup.index]).replaceAll(WORKSPACE_DONE_ICON, '')) === handledPopup.name) {
+        index = handledPopup.index;
       }
-      if (index < 0) throw new Pause('当前内容已完成。无法确认目录中的下一项。');
+      if (index < 0) throw new Pause('无法确认目录中的下一项。');
       const next = leaves.slice(index + 1).map(row => row.querySelector('.leaf-item') || row.firstElementChild).find(node => {
         if (!node) return false;
         const link = node.closest('a[href]') || node.querySelector('a[href]');
@@ -1883,7 +1903,9 @@
         return false;
       });
       if (!next) {
-        run.log(skippedExams ? `学习空间已处理到最后一项。${skippedExams} 场考试待处理。` : '学习空间里当前已加载的项目已处理到最后一项。');
+        const items = skippedItems ? `${skippedItems} 项跳过，仍可在目录中处理。` : '';
+        const exams = skippedExams ? `${skippedExams} 场考试待处理。` : '';
+        run.log(`学习空间已处理到最后一项。${items}${exams}`);
         return;
       }
       const url = location.href;
@@ -1893,21 +1915,36 @@
       const nextIndex = leaves.findIndex(row => row.contains(next));
       await run.click(() => {
         if (location.href !== url) throw new Pause('学习空间已切换，请从当前内容重新开始。');
-        saveHandoff({ id, phase: 'workspace-ppt', from: url, returnUrl: url, classroomId: route.classroomId, item: { name } });
+        saveHandoff({ id, phase: 'workspace-ppt', from: url, returnUrl: url, classroomId: route.classroomId, item: { name, index: nextIndex } });
         return next;
       }, '下一项不可用。');
+      const switched = () => {
+        const fresh = getRoute();
+        const leaf = aiLeaf();
+        if (fresh?.view !== 'ai' || fresh.classroomId !== route.classroomId || (fresh.kind === route.kind && fresh.leaf === route.leaf)) return null;
+        return leaf && leaf !== finishedLeaf && (leaf === next || normalize(label(leaf).replaceAll(WORKSPACE_DONE_ICON, '')) === name) && fresh;
+      };
       const opened = await run.wait(() => {
         if (sessionStorage.getItem(HANDOFF_ACK_KEY) === id) return 'new-tab';
-        const fresh = getRoute();
-        if (location.href === url || fresh?.view !== 'ai' || fresh.classroomId !== route.classroomId || aiLeaf() === finishedLeaf) return false;
-        return aiLeaf() && (fresh.kind !== route.kind || aiLeafDone() || assetChanged(oldContent, fresh.kind)) && 'same-tab';
-      }, '下一项未加载完成，已停止切换。');
-      completedPopup = null;
+        const fresh = switched();
+        return fresh && (fresh.kind !== route.kind || aiLeafDone() || assetChanged(oldContent, fresh.kind)) && 'same-tab';
+      }, new SkipItem('下一项未加载完成。')).catch(error => {
+        if (!(error instanceof SkipItem)) throw error;
+        run.check();
+        if (!switched()) throw new Pause('目录未切换到所选的下一项。');
+        return 'unavailable';
+      });
+      contentUnavailable = opened === 'unavailable';
+      handledPopup = null;
       if (opened === 'new-tab') {
         const result = await waitForPopupResult(run, id);
         if (result === 'paused') throw new Pause('课件标签页已暂停，请查看该页提示。');
-        completedPopup = { node: next, index: nextIndex, name };
-        run.log(`${name} 已确认完成。`);
+        handledPopup = { node: next, index: nextIndex, name };
+        if (result === 'done') run.log(`${name} 已确认完成。`);
+        else {
+          skippedItems++;
+          run.log(`已跳过 ${name}，继续学习空间。`);
+        }
       }
       clearHandoff();
       fromEarlierItem = true;
@@ -1931,10 +1968,10 @@
       const page = location.href;
       const name = label(title) || '当前课程';
       const readDone = () => proDone() || (kind === 'courseware' && hasCoursewareStatus());
-      await studyAsset(run, kind, name, readDone, fromEarlierItem || isExerciseKind(kind) ? () => false : readDone);
+      const outcome = await processAsset(run, kind, name, readDone, fromEarlierItem || isExerciseKind(kind) ? () => false : readDone);
       const next = firstVisible(document, '.btn-next');
       if (!next || !isEnabled(next)) {
-        run.log(`${name} 已确认完成。`);
+        if (outcome === 'done') run.log(`${name} 已确认完成。`);
         return;
       }
       const oldContent = assetStamp(kind);
@@ -1960,7 +1997,8 @@
       return '';
     }, '没有识别到当前学习内容。可以返回目录再点「开始」。');
     const name = label(firstVisible(document, '.dialog-header h2, .title h2, h1')) || '当前内容';
-    await studyAsset(run, kind, name, () => assetDone(kind), isExerciseKind(kind) ? () => false : undefined);
+    const outcome = await processAsset(run, kind, name, () => assetDone(kind), isExerciseKind(kind) ? () => false : undefined);
+    if (outcome === 'skipped') return false;
     run.log(`${name} 已确认完成。`);
     return kind === 'courseware' && await continueFromCourseware(run);
   }
@@ -2065,7 +2103,7 @@
     const saveButton = form.querySelector('button[type="submit"]');
     const log = message => {
       byId('status').textContent = message;
-      if (NATIVE) YKT_STUDY_STATUS(message);
+      if (NATIVE) return YKT_STUDY_STATUS(message);
     };
     const taskSettings = ['autoPractice', 'autoHomework', 'autoDiscussion'];
     const toggleAiSettings = () => {
@@ -2152,6 +2190,7 @@
       let navigating = false;
       try {
         if (handoff?.phase === 'workspace-ppt') navigating = await studyWorkspacePpt(run, handoff);
+        else if (handoff?.phase === 'workspace-return') await studyAiWorkspace(run, handoff);
         else if (handoff || route?.view === 'directory') navigating = await studyFromDirectory(run, handoff);
         else if (route?.view === 'ai') await studyAiWorkspace(run);
         else if (route?.view === 'pro') await studyPro(run);

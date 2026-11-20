@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.2.10
+// @version      3.2.11
 // @description  按页面状态辅助播放、阅读课件和完成非考试学习任务。
 // @author       风之子
 // @license      GPL3
@@ -54,6 +54,7 @@
   const EXAM_PATH = /(?:^|\/)(?:(?:student)?exam(?:ination)?|kaoshi|timed-exam)(?:\/|$)/i;
 
   class Pause extends Error {}
+  class StatusPending extends Pause {}
 
   const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
   const label = element => normalize(element?.innerText ?? element?.textContent);
@@ -162,7 +163,7 @@
         if (value) return value;
         await sleep(250, this.signal);
       } while (performance.now() < until);
-      throw new Pause(message);
+      throw message instanceof Pause ? message : new Pause(message);
     }
 
     async click(target, message) {
@@ -306,6 +307,11 @@
     return Boolean(firstVisible(doc, '.video-question, .player-question, .xt-video-question, .pop-question'));
   }
 
+  function playerPlayButton(media) {
+    const player = media.closest('xt-wrap');
+    return player && firstVisible(player, 'xt-playbutton');
+  }
+
   function sameResourcePage(address) {
     const before = new URL(address);
     const current = new URL(location.href);
@@ -338,17 +344,21 @@
     run.log(`播放 ${name}`);
     const readyToPlay = !media.ended && !playerQuestionVisible(media.ownerDocument);
     const video = media.localName === 'video';
-    let selectedPlayerRate = false;
+    const player = video && media.closest('xt-wrap');
+    let nextRateAttempt = 0;
     const useVideoRate = () => {
       if (!video) return;
-      if (!selectedPlayerRate) {
-        const options = media.closest('xt-wrap')?.querySelectorAll('xt-speedlist xt-button[data-speed]') || [];
-        const option = Array.from(options).find(button => Number(button.getAttribute('data-speed')) === 2
+      if (player) {
+        const displayed = label(player.querySelector('xt-speedvalue'));
+        if ((media.playbackRate === 2 && (!displayed || /^2(?:\.0+)?\s*[x×]$/i.test(displayed))) || performance.now() < nextRateAttempt) return;
+        const option = Array.from(player.querySelectorAll('xt-speedlist [data-speed]'))
+          .find(button => Number(button.getAttribute('data-speed')) === 2
           && !button.closest('[disabled], [aria-disabled="true"], .is-disabled, [inert], [hidden]'));
         if (option) {
-          selectedPlayerRate = true;
+          nextRateAttempt = performance.now() + 1_000;
           option.click();
         }
+        return;
       }
       if (media.defaultPlaybackRate !== 2) media.defaultPlaybackRate = 2;
       if (media.playbackRate !== 2) media.playbackRate = 2;
@@ -356,12 +366,16 @@
     if (readyToPlay) useVideoRate();
     if (readyToPlay && media.paused) {
       // 只尝试启动一次。播放器主动暂停或要求确认时，由用户继续。
-      try {
-        Promise.resolve(media.play()).catch(() => {
-          if (!run.signal.aborted && media.isConnected && media.paused) run.log('请点击网页播放器的播放键。');
-        });
-      } catch {
-        run.log('请点击网页播放器的播放键。');
+      const play = playerPlayButton(media);
+      if (isEnabled(play)) play.click();
+      else if (!player) {
+        try {
+          Promise.resolve(media.play()).catch(() => {
+            if (!run.signal.aborted && media.isConnected && media.paused) run.log('请点击网页播放器的播放键。');
+          });
+        } catch {
+          run.log('请点击网页播放器的播放键。');
+        }
       }
     }
     let lastTime = media.currentTime;
@@ -369,6 +383,7 @@
     const playbackStartedAt = lastMovement;
     let pausedNotice = false;
     let playbackReported = false;
+    let reportedRate;
     while (true) {
       run.check();
       if (!sameResourcePage(page) || !mediaVisible(media) || (source && source !== media.currentSrc)) {
@@ -383,9 +398,10 @@
       if (!media.paused && !media.seeking && (advancing || playbackReported)) useVideoRate();
       if (advancing) {
         lastMovement = now;
-        if (!playbackReported) {
+        if (!playbackReported || (video && media.playbackRate !== reportedRate)) {
           run.log(`正在播放 ${name}${video ? ` · ${media.playbackRate}×` : ''}`);
           playbackReported = true;
+          reportedRate = media.playbackRate;
         }
       }
       lastTime = media.currentTime;
@@ -408,14 +424,43 @@
     await run.wait(() => {
       if (!sameResourcePage(page)) throw new Pause('页面已切换，当前项的完成状态未确认。');
       return readDone();
-    }, `${name} 尚未显示完成，已停在当前项。`, STATUS_WAIT);
+    }, new StatusPending(`${name} 尚未显示完成，已停在当前项。`), STATUS_WAIT);
   }
 
   async function studyMedia(run, kind, name, readDone, readMedia = () => courseMedia(kind)) {
     const url = location.href;
     const headerDone = () => workspaceAssetDone(kind, name);
-    if (await watchMedia(run, readMedia, name, headerDone)) {
-      await confirmStatus(run, url, () => headerDone() || readDone(), name);
+    const done = () => headerDone() || readDone();
+    let replayed = false;
+    while (true) {
+      const media = await watchMedia(run, readMedia, name, headerDone);
+      if (!media) return;
+      try {
+        await confirmStatus(run, url, done, name);
+        return;
+      } catch (error) {
+        if (!(error instanceof StatusPending) || kind !== 'video') throw error;
+        const progress = workspaceVideoProgress(name);
+        if (progress === null) throw error;
+        const replay = playerPlayButton(media);
+        const missedStart = !media.played.length || media.played.start(0) > 1;
+        if (replayed || progress !== 0 || !missedStart || !isEnabled(replay) || label(replay) !== '重播') {
+          throw new Pause(`${name} 已播到末尾，雨课堂完成度仍为 ${progress}%。请查看视频「详情」中的观看记录。`);
+        }
+        await run.wait(() => document.visibilityState === 'visible', '请回到视频页面后继续。', MANUAL_WAIT);
+        if (!sameResourcePage(url) || readMedia() !== media) throw new Pause('视频页面已切换。');
+        if (done()) return;
+        if (!media.ended || !isEnabled(replay) || label(replay) !== '重播') throw new Pause('播放器状态已变化，请从当前视频继续。');
+        replayed = true;
+        run.log('页面仍显示 0%，本页没有从开头的播放记录。使用网页的重播按钮补看一次。');
+        replay.click();
+        const resumed = await run.wait(() => {
+          if (!sameResourcePage(url)) throw new Pause('视频页面已切换。');
+          if (done()) return 'done';
+          return !media.paused && !media.ended && 'playing';
+        }, '重播尚未开始，请点击网页播放器的播放键。');
+        if (resumed === 'done') return;
+      }
     }
   }
 
@@ -1373,9 +1418,21 @@
       .filter(node => !node.closest('.logs-list, .nav-item-leaf-box')).some(node => isDone(label(node))));
   }
 
+  function workspaceVideoProgress(name) {
+    const route = getRoute();
+    if (route?.view !== 'ai' || route.kind !== 'video') return null;
+    const title = normalize(name).replace(/^视频\s+/, '');
+    if (!title) return null;
+    const header = visible(document, '.learning-space-control-unit').find(unit =>
+      visible(unit, 'h1, h2, h3, div, span').some(node => label(node).replace(/^视频\s+/, '') === title));
+    const match = header && label(firstVisible(header, '.rate-detail > .text')).match(/^完成度\s*[:：]\s*(\d+(?:\.\d+)?)\s*%$/);
+    return match && Number(match[1]) <= 100 ? Number(match[1]) : null;
+  }
+
   function workspaceAssetDone(kind, name) {
     const route = getRoute();
     if (route?.view !== 'ai' || route.kind !== kind) return false;
+    if (kind === 'video' && workspaceVideoProgress(name) === 100) return true;
     const statuses = { reading: ['已读'], video: ['已完成'], audio: ['已完成'], discussion: ['已参与', '已讨论', '已回复', '已发表', '已发帖', '已发言', '已完成'] }[kind];
     if (!statuses) return false;
     const title = normalize(name).replace(/^(?:图文|视频|音频|讨论)\s+/, '');
@@ -1780,6 +1837,7 @@
     const leaf = aiLeaf();
     if (!leaf) return false;
     if (hasDone(leaf, `${STATUS_SELECTOR}, .leaf-status, .progress, .status`)) return true;
+    if (firstVisible(leaf, '.leaf-item-status .icon-yuanquangou-mianzhuang')) return true;
     return visible(leaf, 'i, span, [class*="icon"]').some(icon => {
       if (label(icon) === WORKSPACE_DONE_ICON) return true;
       const view = icon.ownerDocument.defaultView;
@@ -1800,15 +1858,18 @@
       const route = getRoute();
       if (route?.view !== 'ai') throw new Pause('已离开学习空间。');
       const active = await run.wait(aiLeaf, '未识别到当前知识点。');
+      const currentPage = location.href;
       if (!completedPopup) {
         const name = normalize(label(active).replaceAll(WORKSPACE_DONE_ICON, '')) || '当前知识点';
         const readDone = () => aiLeafDone() || assetDone(route.kind);
         const verifyLeaf = fromEarlierItem || isExerciseKind(route.kind) || route.kind === 'discussion';
         await studyAsset(run, route.kind, name, readDone, verifyLeaf ? aiLeafDone : readDone);
+        if (!sameResourcePage(currentPage)) throw new Pause('学习空间已切换，请从当前内容重新开始。');
         run.log(`${name} 已确认完成。`);
       }
+      const finishedLeaf = aiLeaf() || active;
       const leaves = visible(document, '.nav-item-leaf-box');
-      let index = leaves.findIndex(node => node.contains(completedPopup?.node || active));
+      let index = leaves.findIndex(node => node.contains(completedPopup?.node || finishedLeaf));
       if (index < 0 && completedPopup && normalize(label(leaves[completedPopup.index]).replaceAll(WORKSPACE_DONE_ICON, '')) === completedPopup.name) {
         index = completedPopup.index;
       }
@@ -1838,7 +1899,7 @@
       const opened = await run.wait(() => {
         if (sessionStorage.getItem(HANDOFF_ACK_KEY) === id) return 'new-tab';
         const fresh = getRoute();
-        if (location.href === url || fresh?.view !== 'ai' || fresh.classroomId !== route.classroomId || aiLeaf() === active) return false;
+        if (location.href === url || fresh?.view !== 'ai' || fresh.classroomId !== route.classroomId || aiLeaf() === finishedLeaf) return false;
         return aiLeaf() && (fresh.kind !== route.kind || aiLeafDone() || assetChanged(oldContent, fresh.kind)) && 'same-tab';
       }, '下一项未加载完成，已停止切换。');
       completedPopup = null;

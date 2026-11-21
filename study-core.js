@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.2.12
+// @version      3.2.13
 // @description  按页面状态辅助播放、阅读课件和完成非考试学习任务。
 // @author       风之子
 // @license      GPL3
@@ -42,6 +42,7 @@
   const STATUS_WAIT = 40_000;
   const MANUAL_WAIT = 60 * 60 * 1000;
   const PLAYBACK_IDLE = 120_000;
+  const MAX_PLAYER_RATE_ATTEMPTS = 3;
   const STATUS_SELECTOR = '.progress-wrap .text, .study-progress .text, .study-status, .learn-status';
   const ROW_STATUS = '.statistics-box .aside, .unfinished-study__item-status';
   const UNFINISHED_ROW = '.unfinished-study__item';
@@ -349,16 +350,19 @@
     const readyToPlay = !media.ended && !playerQuestionVisible(media.ownerDocument);
     const video = media.localName === 'video';
     const player = video && media.closest('xt-wrap');
+    let rateAttempts = 0;
     let nextRateAttempt = 0;
     const useVideoRate = () => {
       if (!video) return;
       if (player) {
+        if (rateAttempts >= MAX_PLAYER_RATE_ATTEMPTS) return;
         const displayed = label(player.querySelector('xt-speedvalue'));
         if ((media.playbackRate === 2 && (!displayed || /^2(?:\.0+)?\s*[x×]$/i.test(displayed))) || performance.now() < nextRateAttempt) return;
         const option = Array.from(player.querySelectorAll('xt-speedlist [data-speed]'))
           .find(button => Number(button.getAttribute('data-speed')) === 2
           && !button.closest('[disabled], [aria-disabled="true"], .is-disabled, [inert], [hidden]'));
         if (option) {
+          rateAttempts++;
           nextRateAttempt = performance.now() + 1_000;
           option.click();
         }
